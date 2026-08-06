@@ -70,11 +70,60 @@ warning. You can continue to the page from its "Advanced" options.
 Press the "Start" button on the page to start teleoperation with your
 VR device.
 
+## Head camera
+
+This dora-rs node can also show the robot's head camera in the VR
+device, so that the operator sees the robot's workspace while
+teleoperating.
+
+The node accepts JPEG images on the `camera_head_right` input and
+forwards them to the VR device, where they are drawn on a panel fixed
+in the room: straight ahead of where the headset was when the session
+started, at eye height. Both eyes see the same image, and the panel
+stays put when the operator moves their head. See
+[`example/dataflow_mujoco_camera.yaml`](example/dataflow_mujoco_camera.yaml)
+and
+[`example/dataflow_mujoco_camera_stereo.yaml`](example/dataflow_mujoco_camera_stereo.yaml).
+
+How the panel is drawn is described by a view configuration file,
+passed with `--view-configuration-file`. The node reads it once when
+it starts, so restart the dataflow to apply a change. The example
+files select the view with their `view` key:
+
+- [`example/view_camera.yaml`](example/view_camera.yaml) — the
+  default `fixed` view above. Parameters: the session mode, the panel
+  distance and the panel width (the height follows the image aspect
+  ratio).
+- [`example/view_camera_stereo.yaml`](example/view_camera_stereo.yaml)
+  — the `stereo` view: one image per eye on a head-locked panel, for a
+  side-by-side stereo camera such as a ZED Mini. It also needs the
+  `camera_head_left` input, and
+  [`example/zed_view_parameters.py`](example/zed_view_parameters.py)
+  works its camera and alignment parameters out from a ZED camera's
+  factory calibration.
+
+`view: none` shows no camera at all: the operator sees the passthrough
+and only the controller poses are used.
+
+Both files also take `pose.frame_offset`: the neutral hand position
+relative to the `arm_origin` site in meters, overriding the built-in
+default of `[-0.085, 0, -0.14]`.
+
 ## Debug
 
 You can use [Immersive Web
 Emulator](https://chromewebstore.google.com/detail/immersive-web-emulator/cgffilbpcibhmcfbgggfhfolhkfbhmik)
 and Chrome to debug this node without a VR device.
+
+## Inputs
+
+This dora-rs node accepts the following data. Both are optional and
+only needed to show a head camera in the VR device.
+
+| Input                | Type      | Description                                                              |
+|----------------------|-----------|--------------------------------------------------------------------------|
+| `camera_head_right`  | `uint8[]` | A JPEG image of the robot's head camera.                                 |
+| `camera_head_left`   | `uint8[]` | A JPEG image for the left eye. Only used by the stereo view.             |
 
 ## Outputs
 
@@ -113,6 +162,7 @@ useful in a dora-rs dataflow YAML.
 | `--port`                 | `PORT`                 | `8443`      | The port that the Web server listens on.                                          |
 | `--tls-certificate-file` | `TLS_CERTIFICATE_FILE` | (required)  | The TLS certificate file for HTTPS. Required because WebXR requires HTTPS.        |
 | `--tls-key-file`         | `TLS_KEY_FILE`         | (required)  | The TLS key file for the certificate file. Required because WebXR requires HTTPS. |
+| `--view-configuration-file` | `VIEW_CONFIGURATION_FILE` | (none)  | The YAML file that describes how the head camera is drawn in the VR device. Read once when the node starts. |
 
 ## License
 

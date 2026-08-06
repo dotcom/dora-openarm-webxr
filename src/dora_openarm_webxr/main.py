@@ -45,6 +45,7 @@ import time
 import uvicorn
 
 from .smoothing import OneEuroPoseSmoother
+from . import video
 
 args = None
 node = None
@@ -67,6 +68,7 @@ _ROBOT_ROTATION = Rotation.from_matrix(_ROBOT_ROTATION_MATRIX)
 # We need to move it to OpenArm position.
 #
 # Neutral hand position relative to the arm_origin site (chest level).
+# Overridden by ``pose: frame_offset`` in the view configuration file.
 _FRAME_OFFSET_CELL: np.ndarray = np.array([-0.085, 0, -0.14], dtype=np.float32)
 
 
@@ -206,6 +208,11 @@ async def _websocket_endpoint(websocket: WebSocket):
         pass
 
 
+# The head camera routes are registered before the static files are
+# mounted on "/" because the mount matches every remaining path.
+video.register_routes(app, lambda: server.should_exit)
+
+
 base_dir = os.path.dirname(__file__)
 app.mount("/", StaticFiles(directory=f"{base_dir}/static", html=True), name="static")
 
@@ -222,6 +229,7 @@ async def _main_dora():
         event = node.next()
         if event["type"] == "STOP":
             break
+        video.handle_event(event)
     server.should_exit = True
 
 
@@ -275,9 +283,18 @@ def main():
         required=tls_key_file_default is None,
         help="TLS key file for the certificate file",
     )
+    video.add_arguments(parser)
 
     global args
     args = parser.parse_args()
+
+    video.configure(args)
+
+    # Read once at startup; restart the dataflow to apply a change.
+    frame_offset = (video.view_configuration().get("pose") or {}).get("frame_offset")
+    if frame_offset is not None:
+        global _FRAME_OFFSET_CELL
+        _FRAME_OFFSET_CELL = np.array(frame_offset, dtype=np.float32).reshape(3)
 
     global node
     node = dora.Node()
