@@ -276,11 +276,26 @@ async def _websocket_endpoint(websocket: WebSocket):
                             pa.array([response[trigger]], type=pa.float32()),
                             metadata,
                         )
+                    grip = f"grip_{side}"
+                    if grip in response:
+                        node.send_output(
+                            grip,
+                            pa.array([response[grip]], type=pa.float32()),
+                            metadata,
+                        )
                     joystick = f"joystick_{side}"
                     if joystick in response:
                         axes = response[joystick]
-                        x = axes[1] - axes[3]
-                        y = axes[2] - axes[0]
+                        # The xr-standard mapping reserves the first axis pair
+                        # for the touchpad and the second for the thumbstick,
+                        # so the stick is axes[2:4] wherever the controller has
+                        # one; a device with only a touchpad reports that pair
+                        # alone and it takes its place. The y sign is flipped
+                        # to keep the convention the Unity sender published,
+                        # which is the one the downstream nodes were written
+                        # against.
+                        x, y = (axes[2], axes[3]) if len(axes) >= 4 else axes[:2]
+                        y = -y
                         node.send_output(
                             f"joystick_x_{side}",
                             pa.array([x], type=pa.float32()),
