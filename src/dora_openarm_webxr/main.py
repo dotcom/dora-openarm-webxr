@@ -23,7 +23,13 @@ state as dora-rs outputs.
 
 The published poses are expressed in the scene's ``arm_origin`` site
 frame (chest-level origin between the arms), not in world coordinates.
-Downstream IK interprets targets in the same frame.
+Downstream IK interprets targets in the same frame. The hand position
+is relative to the headset but keeps the world axes, so looking around
+does not drag the target with the head.
+
+The headset pose that the hands are made relative to is published as
+is on ``pose_reference``, in the WebXR reference space, for consumers
+that drive something from head motion such as a neck.
 
 The Web server and the dora-rs event loop run concurrently in a single
 asyncio event loop; the server shuts down when the dora-rs node
@@ -64,12 +70,36 @@ _ROBOT_ROTATION_MATRIX: np.ndarray = np.array(
 )
 _ROBOT_ROTATION = Rotation.from_matrix(_ROBOT_ROTATION_MATRIX)
 
-# Relative pose is computed from viewer.
+# Relative pose is computed from the viewer position.
 # We need to move it to OpenArm position.
 #
 # Neutral hand position relative to the arm_origin site (chest level).
 # Overridden by ``pose: frame_offset`` in the view configuration file.
 _FRAME_OFFSET_CELL: np.ndarray = np.array([-0.085, 0, -0.14], dtype=np.float32)
+
+# WebXR reports the OpenXR grip pose, whose -Z runs along the handle toward the
+# thumb. Everything below it here -- the _ROBOT_ROTATION frame and the turn onto
+# the end effector axes -- was carried over from the Unity sender, which
+# published the controller pose in the old Oculus convention instead. The two
+# are one fixed rigid transform apart, shipped by Epic as the Unreal legacy pose
+# restore and independently reproduced for Unity by BeatSaberOffsetMigrator:
+#
+#     gripRot = ovrRot * OvrToGripRot
+#     gripPos = ovrPos + ovrRot * OvrToGripPos
+#
+# with OvrToGripRot = Euler(-60, 0, 0) and OvrToGripPos = (0, -0.03, -0.04) in
+# Unity's left-handed axes, which flip to a 60 degree turn about +X and an
+# offset 3 cm down and 4 cm back in the right-handed axes used here. Undo it, so
+# the constants below receive the pose they were tuned for. This is a runtime
+# convention rather than a measurement: it does not move with the operator, and
+# it only changes if the headset runtime changes what it reports.
+_OVR_TO_GRIP: Rotation = Rotation.from_euler("x", 60, degrees=True)
+_OVR_TO_GRIP_POS: np.ndarray = np.array([0.0, -0.03, 0.04], dtype=np.float32)
+
+# The Oculus controller pose points its forward axis where the controller
+# points. This turn maps that frame onto the end effector one, which points the
+# gripper along its own -z and opens it across y.
+_CONTROLLER_TO_EE: Rotation = Rotation.from_euler("z", 90, degrees=True)
 
 
 app = FastAPI()
@@ -83,8 +113,19 @@ def _map_trigger_to_gripper(trigger: float, side: str) -> float:
         return (1.57 / 2.0) * (1.0 - trigger)  # 0-> 1.57, 1->0
 
 
-def _adjust_pose(pose, smoother, smoother_time):
+def _adjust_pose(pose, reference, smoother, smoother_time):
     """Convert WebXR style pose to our style.
+
+    ``pose`` and ``reference`` (the viewer pose) are in the same
+    world-fixed reference space. Only the position is made relative to
+    the viewer, by subtracting it in the world axes. The viewer
+    rotation is never applied: turning the head must not move the
+    target. The controller orientation is passed through as its world
+    orientation for the same reason.
+
+    The controller pose itself is converted from the WebXR grip space to
+    the Oculus convention first, so that the robot frame constants get
+    the pose the Unity sender they came from used to give them.
 
     WebXR style:
       * right-handed
@@ -102,12 +143,22 @@ def _adjust_pose(pose, smoother, smoother_time):
       * right-handed
       * [x, y, z, qw, qx, qy, qz]
     """
-    position = np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32)
-    position = _ROBOT_ROTATION.apply(position) + _FRAME_OFFSET_CELL
+    position = np.array(
+        [
+            pose["x"] - reference["x"],
+            pose["y"] - reference["y"],
+            pose["z"] - reference["z"],
+        ],
+        dtype=np.float32,
+    )
     rotation = Rotation.from_quat([pose["qx"], pose["qy"], pose["qz"], pose["qw"]])
-    # TODO: Add a comment why we need this
-    rotation_fix = Rotation.from_euler("z", 90, degrees=True)
-    rotation = _ROBOT_ROTATION * rotation * rotation_fix
+
+    # Back out of the grip pose to the Oculus one the robot constants expect.
+    rotation = rotation * _OVR_TO_GRIP.inv()
+    position = position - rotation.apply(_OVR_TO_GRIP_POS)
+
+    position = _ROBOT_ROTATION.apply(position) + _FRAME_OFFSET_CELL
+    rotation = _ROBOT_ROTATION * rotation * _CONTROLLER_TO_EE
     quaternion = rotation.as_quat()
 
     adjusted_pose = np.array(
@@ -133,6 +184,36 @@ def _build_pose_output(pose: np.ndarray) -> pa.Array:
     return pa.array([{"pose": pose}], type=_POSE_STRUCT_TYPE)
 
 
+def _build_head_pose_output(pose: dict) -> pa.Array:
+    """Wrap the headset pose, in our style: [x, y, z, qw, qx, qy, qz].
+
+    Unrotated, unlike the hands. `_adjust_pose` applies `_ROBOT_ROTATION` and a
+    z+90 fix to put a controller where the arm expects its end effector; both
+    are arm conventions and neither means anything on a head. Consumers map the
+    WebXR frame (x right, y up, -z forward) into their own body frame, so the
+    rig's wiring stays in the consumer's config rather than baked in here.
+
+    Not made relative either: the hand positions are relative to this pose, so
+    subtracting it from itself would leave nothing to read the head from.
+
+    Not smoothed either: the One Euro smoothers are per-hand and stateful, and
+    a neck has its own rate limiting downstream.
+    """
+    head_pose = np.array(
+        [
+            pose["x"],
+            pose["y"],
+            pose["z"],
+            pose["qw"],
+            pose["qx"],
+            pose["qy"],
+            pose["qz"],
+        ],
+        dtype=np.float32,
+    )
+    return _build_pose_output(head_pose)
+
+
 @app.websocket("/websocket")
 async def _websocket_endpoint(websocket: WebSocket):
     smoothers = {
@@ -156,6 +237,13 @@ async def _websocket_endpoint(websocket: WebSocket):
                     pa.array([metadata["timestamp"]], type=pa.int64()),
                     metadata,
                 )
+                reference = response.get("pose_reference")
+                if reference:
+                    node.send_output(
+                        "pose_reference",
+                        _build_head_pose_output(reference),
+                        metadata,
+                    )
                 for button in ["a", "b", "x", "y"]:
                     name = f"button_{button}"
                     if name in response:
@@ -167,10 +255,10 @@ async def _websocket_endpoint(websocket: WebSocket):
                 for side in ["right", "left"]:
                     pose = f"pose_{side}"
                     trigger = f"trigger_{side}"
-                    if pose in response and trigger in response:
+                    if pose in response and trigger in response and reference:
                         smoother = smoothers[side]
                         adjusted_pose = _adjust_pose(
-                            response[pose], smoother, smoother_time
+                            response[pose], reference, smoother, smoother_time
                         )
                         gripper_angle = _map_trigger_to_gripper(response[trigger], side)
                         gripper_array = np.array([gripper_angle], dtype=np.float32)

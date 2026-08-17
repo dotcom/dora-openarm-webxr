@@ -129,13 +129,31 @@ if (navigator.xr) {
     websocket.send(JSON.stringify(response));
   }
   function sendFrame(session, space, time, frame) {
-    if (session.inputSources.length < 2) {
-      return;
-    }
     const response = {
       type: "frame",
       time: time,
     };
+    // Read before the controller check below, so a consumer driving something
+    // from head motion keeps tracking while the controllers are off or asleep.
+    // The hand poses are made relative to this pose by the node, so when it is
+    // missing the node drops them and only the head keeps flowing.
+    const viewerPose = frame.getViewerPose(space);
+    if (viewerPose) {
+      const transform = viewerPose.transform;
+      response.pose_reference = {
+        x: transform.position.x,
+        y: transform.position.y,
+        z: transform.position.z,
+        qx: transform.orientation.x,
+        qy: transform.orientation.y,
+        qz: transform.orientation.z,
+        qw: transform.orientation.w,
+      };
+    }
+    if (session.inputSources.length < 2) {
+      websocket.send(JSON.stringify(response));
+      return;
+    }
     for (const source of session.inputSources) {
       if (source.handedness === "none") {
         continue;
@@ -213,9 +231,11 @@ if (navigator.xr) {
     }
 
     Promise.all([
-      // We send relative position from viewer to the dora-rs node.
-      // Only the fixed view uses the world-fixed local space, to hang
-      // its panel in the room; the hand poses never do.
+      // The hand poses and the head pose are both read in the
+      // world-fixed local space, and the node makes the hand positions
+      // relative to the head pose without inheriting the head rotation.
+      // The stereo view locks its panel to the viewer space; the fixed
+      // view hangs it in the room.
       session.requestReferenceSpace("viewer"),
       session.requestReferenceSpace("local"),
     ])
@@ -224,7 +244,7 @@ if (navigator.xr) {
           configuration.view === "fixed" ? localSpace : viewerSpace;
         function onFrame(time, frame) {
           log("sources: " + session.inputSources.length);
-          sendFrame(session, viewerSpace, time, frame);
+          sendFrame(session, localSpace, time, frame);
           if (cameraPanel) {
             cameraPanel.render(session, panelSpace, frame);
           }
