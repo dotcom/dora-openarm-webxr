@@ -38,6 +38,7 @@ receives a ``STOP`` event.
 
 import argparse
 import asyncio
+import collections
 import dora
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -49,8 +50,10 @@ import pyarrow as pa
 from scipy.spatial.transform import Rotation
 import time
 import uvicorn
+import yaml
 
 from .smoothing import OneEuroPoseSmoother
+from . import calibration
 from . import video
 
 args = None
@@ -90,6 +93,312 @@ _FRAME_OFFSET_CELL: np.ndarray = np.array([-0.085, 0, -0.14], dtype=np.float32)
 # gripper along its own -z and opens it across y.
 _CONTROLLER_TO_EE: Rotation = Rotation.from_euler("z", 90, degrees=True)
 
+# Eyes to the neck's rotation axis, in the headset's own frame: -Z is forward
+# and +Y is up here, so this reads as below and behind the face.
+#
+# The head does not turn about the headset. The rotation axis is in the neck,
+# and the headset rides ahead of it, so a head turn swings the headset along an
+# arc. Subtracting the headset position alone therefore still reads that arc as
+# the operator translating, and drags the target with it -- 4 to 6 cm at 30
+# degrees and 11 cm at 90. Subtracting the pivot instead leaves the reference
+# motionless under head rotation while it keeps translating when the operator
+# leans or walks, so the workspace follows the body without inheriting the neck.
+#
+# This is the neck model that 3DOF VR used in reverse: there it synthesised the
+# eye translation a headset could not measure, here it removes the one we can.
+#
+# An estimate, not a measurement, and anatomy varies: override it per operator
+# with ``pose: neck_pivot_offset`` in the view configuration file, or measure it
+# in a session started with --calibration, by holding the Y button down while
+# turning the head. Setting it to [0, 0, 0] restores the plain headset
+# subtraction, which is also how the two can be compared.
+_NECK_PIVOT_OFFSET: np.ndarray = np.array([0.0, -0.075, 0.080], dtype=np.float32)
+
+# Whether the Y button measures the neck pivot at all, from --calibration.
+# Off unless asked for: the button is published as an output in its own right
+# and a dataflow may have wired it to something the operator holds down, so
+# outside a calibration session it stays an ordinary button and the hands never
+# stop. Measuring is a thing the operator sets out to do, not something a press
+# can start by accident.
+_CALIBRATION_ENABLED: bool = False
+
+# Where an accepted run is written and where a saved one is read back from, at
+# startup, from --neck-pivot-file. A fit lives as long as the session
+# otherwise, and the whole point of measuring an operator is keeping the number
+# they measured.
+_NECK_PIVOT_FILE = None
+
+
+# How many headset poses a run may hold. A button left held down stops growing
+# here instead of the process, and at the headset's display rate this is some
+# twenty seconds, well past any deliberate shake.
+_CALIBRATION_CAPACITY = 2000
+
+# Fewer poses than this and the run is too thin to fit from. At the headset's
+# display rate this is a second or so of holding, so it catches the operator
+# who lets the button go before turning their head at all.
+_CALIBRATION_MIN_SAMPLES = 100
+
+# A run has to turn the head far enough about every axis for the fit to see
+# all three offset components. 0.02 is about a 20 degree sweep, which a
+# deliberate shake passes twice over.
+_CALIBRATION_MIN_OBSERVABILITY = 0.02
+
+# The headset's own axes, in the order the offset components come in.
+_OFFSET_AXIS_NAMES = ("lateral", "vertical", "fore-aft")
+
+# The head motion that pins each of those components. A rotation cannot see
+# the offset along the axis it turns about, so what is missing is always a
+# turn about a different one: only yawing hides the vertical offset, and
+# only nodding hides the lateral one.
+_PINNING_MOTION = ("side to side", "up and down", "side to side")
+
+# How far the fitted pivot may still wander over the run, in meters. Body
+# motion lands here, and so does the model error: a neck yaws and nods about
+# joints a few centimeters apart rather than the one point fitted here, so
+# some residual is the anatomy rather than the operator. 20 mm leaves the
+# offset good to about a centimeter, against the 11 cm error it removes.
+_CALIBRATION_MAX_RESIDUAL = 0.020
+
+# Where a neck can be, relative to the eyes, in meters: on the midline, and
+# below and behind them. A run that satisfies everything above can still land
+# somewhere a body does not go, and this is the last thing between that and
+# the arm following it.
+_CALIBRATION_MAX_LATERAL = 0.05
+_CALIBRATION_MAX_VERTICAL = 0.20
+_CALIBRATION_MAX_FORE_AFT = 0.20
+
+
+class _PivotCalibration:
+    """Collects headset poses while the operator holds the Y button down.
+
+    The button state arrives once per frame rather than as a press and a
+    release event, so the edges are found here. Reading it that way is
+    also the failsafe: a controller that falls asleep mid-run stops
+    reporting the button at all, the caller reads that as not pressed,
+    and the run ends instead of leaving the hands stopped for good.
+
+    A node started without ``--calibration`` holds a disabled one, which
+    keeps no poses and never stops the hands: the Y button reaches its
+    output and nothing else happens.
+    """
+
+    def __init__(self, enabled=False, capacity=_CALIBRATION_CAPACITY):
+        self._enabled = enabled
+        self._running = False
+        self._samples = collections.deque(maxlen=capacity)
+
+    @property
+    def collecting(self):
+        """Whether a run is under way, so poses belong to it."""
+        return self._running
+
+    def update(self, pressed):
+        """Take the button state for a frame, returning a finished run.
+
+        The press is the run: it starts the frame the button goes down
+        and is fitted the frame it comes up. Nothing waits for a hold,
+        because only a session started with ``--calibration`` reaches
+        here, and in one the operator pressing Y wants exactly this. The
+        headset says so on its own display, so the hands stopping is no
+        longer the only signal the operator gets.
+
+        Args:
+          pressed: whether the Y button is down this frame.
+
+        Returns:
+          The run's poses as ``(N, 7)`` rows of ``[x, y, z, qx, qy, qz,
+          qw]``, which is the quaternion order ``Rotation.from_quat``
+          reads, or None if this frame ended no run worth fitting.
+
+        """
+        if not self._enabled:
+            return None
+
+        if pressed:
+            if not self._running:
+                self._running = True
+                self._samples.clear()
+            return None
+
+        running, self._running = self._running, False
+        if not running or not self._samples:
+            return None
+        return np.array(self._samples, dtype=np.float64)
+
+    def add(self, reference):
+        """Keep a headset pose if a run is under way, otherwise drop it."""
+        if not self.collecting:
+            return
+        self._samples.append(
+            [
+                reference["x"],
+                reference["y"],
+                reference["z"],
+                reference["qx"],
+                reference["qy"],
+                reference["qz"],
+                reference["qw"],
+            ]
+        )
+
+
+def _apply_pivot_calibration(samples):
+    """Fit the neck pivot from a run, say what came of it, and use it.
+
+    The fitted offset only replaces the one in use if it passes every
+    check, so a run that went wrong costs the operator the shake and
+    nothing else.
+
+    Returns what to tell the headset about the run, since the operator is
+    wearing one and cannot read the node's output from inside it.
+    """
+    offset, diagnostics = calibration.fit_pivot_offset(
+        samples[:, :3], Rotation.from_quat(samples[:, 3:])
+    )
+    reason = _check_pivot_offset(offset, diagnostics)
+    if reason is not None:
+        print(f"neck pivot calibration rejected: {reason}", flush=True)
+        return {"type": "calibration-result", "accepted": False, "reason": reason}
+
+    global _NECK_PIVOT_OFFSET
+    _NECK_PIVOT_OFFSET = offset.astype(np.float32)
+    saved_to = _save_neck_pivot_offset(offset)
+
+    formatted = ", ".join(f"{component:.3f}" for component in offset)
+    kept = (
+        f"  Written to {saved_to}, which this node reads at startup."
+        if saved_to is not None
+        else "  Kept for this session only; --neck-pivot-file writes it down."
+    )
+    print(
+        f"neck pivot calibration applied from {diagnostics['samples']} poses: "
+        f"the pivot held to {diagnostics['residual_rms'] * 1000:.1f} mm while "
+        f"the headset moved {diagnostics['headset_rms'] * 1000:.1f} mm.\n"
+        f"  neck_pivot_offset: [{formatted}]\n" + kept,
+        flush=True,
+    )
+    return {
+        "type": "calibration-result",
+        "accepted": True,
+        "offset": [float(component) for component in offset],
+        "samples": int(diagnostics["samples"]),
+        "residual_mm": float(diagnostics["residual_rms"]) * 1000.0,
+        "headset_mm": float(diagnostics["headset_rms"]) * 1000.0,
+        "saved_to": saved_to,
+    }
+
+
+def _save_neck_pivot_offset(offset):
+    """Write an accepted offset where the next run reads it.
+
+    The document nests the offset the way the view configuration file
+    nests it, so the measurement can be pasted there as it stands.
+
+    Returns the path written, or None if there was nowhere to write it or
+    the write failed. A measurement that cannot be saved is still worth
+    having for the session, so a failure is reported and nothing else.
+    """
+    if _NECK_PIVOT_FILE is None:
+        return None
+    document = {
+        "pose": {
+            "neck_pivot_offset": [round(float(component), 4) for component in offset]
+        }
+    }
+    try:
+        with open(_NECK_PIVOT_FILE, "w", encoding="utf-8") as output:
+            output.write("# Measured by dora-openarm-webxr --calibration.\n")
+            yaml.safe_dump(document, output)
+    except OSError as error:
+        print(f"cannot write {_NECK_PIVOT_FILE}: {error}", flush=True)
+        return None
+    return str(_NECK_PIVOT_FILE)
+
+
+def _read_neck_pivot_offset(path):
+    """Read a measured offset back, or None if there is not one to read."""
+    if path is None:
+        return None
+    try:
+        with open(path, encoding="utf-8") as input:
+            document = yaml.safe_load(input)
+    except FileNotFoundError:
+        # Nothing measured yet, which is every first run.
+        return None
+    except (OSError, yaml.YAMLError) as error:
+        print(f"cannot read {path}: {error}", flush=True)
+        return None
+    pose = document.get("pose") if isinstance(document, dict) else None
+    offset = pose.get("neck_pivot_offset") if isinstance(pose, dict) else None
+    if offset is None:
+        return None
+    return np.array(offset, dtype=np.float32).reshape(3)
+
+
+def _configure_neck_pivot(pose_configuration, path):
+    """Settle which neck pivot offset the session starts with.
+
+    The built-in estimate is the floor, the view configuration file
+    overrides it, and a measured one overrides that: of the three it is
+    the only one that came from the operator wearing the headset. Said
+    out loud rather than applied quietly, because a file left behind by
+    someone else's head would otherwise be invisible.
+    """
+    global _NECK_PIVOT_OFFSET
+    configured = pose_configuration.get("neck_pivot_offset")
+    if configured is not None:
+        _NECK_PIVOT_OFFSET = np.array(configured, dtype=np.float32).reshape(3)
+
+    measured = _read_neck_pivot_offset(path)
+    if measured is not None:
+        _NECK_PIVOT_OFFSET = measured
+        formatted = ", ".join(f"{component:.3f}" for component in measured)
+        print(f"neck pivot offset read from {path}: [{formatted}]", flush=True)
+
+
+def _check_pivot_offset(offset, diagnostics):
+    """Why a fitted neck pivot offset is not worth applying, or None.
+
+    The fit itself reports what the run could and could not see; the
+    thresholds live here, next to the operator who has to be told what to
+    do differently.
+    """
+    samples = diagnostics["samples"]
+    if samples < _CALIBRATION_MIN_SAMPLES:
+        return (
+            f"only {samples} headset poses came in; "
+            "hold Y down for the whole head turn, not just a tap"
+        )
+
+    observability = diagnostics["observability"]
+    if observability[0] < _CALIBRATION_MIN_OBSERVABILITY:
+        axis = int(np.argmax(np.abs(diagnostics["observability_axes"][0])))
+        return (
+            f"the head did not turn enough to see the {_OFFSET_AXIS_NAMES[axis]} "
+            f"offset; turn it {_PINNING_MOTION[axis]} as well"
+        )
+
+    residual = diagnostics["residual_rms"]
+    if residual > _CALIBRATION_MAX_RESIDUAL:
+        return (
+            f"the pivot still moved {residual * 1000:.0f} mm over the run; "
+            "hold the body still and turn only the head"
+        )
+
+    lateral, vertical, fore_aft = offset
+    if (
+        abs(lateral) > _CALIBRATION_MAX_LATERAL
+        or not -_CALIBRATION_MAX_VERTICAL <= vertical <= 0.0
+        or not 0.0 <= fore_aft <= _CALIBRATION_MAX_FORE_AFT
+    ):
+        return (
+            f"the fitted offset [{lateral:.3f}, {vertical:.3f}, {fore_aft:.3f}] "
+            "is not where a neck is: it belongs on the midline, below the eyes "
+            "and behind them"
+        )
+    return None
+
 
 app = FastAPI()
 
@@ -112,6 +421,13 @@ def _adjust_pose(pose, reference, smoother, smoother_time):
     target. The controller orientation is passed through as its world
     orientation for the same reason.
 
+    What is subtracted is the neck pivot rather than the headset itself,
+    since the headset orbits that pivot as the head turns and would
+    otherwise carry the arc into the target. The viewer rotation is used
+    to place the pivot, which is not the same as applying it to the
+    hand: it only says which way the operator is facing, so the point
+    behind their face can be found.
+
     WebXR style:
       * right-handed
       * {
@@ -128,14 +444,16 @@ def _adjust_pose(pose, reference, smoother, smoother_time):
       * right-handed
       * [x, y, z, qw, qx, qy, qz]
     """
-    position = np.array(
-        [
-            pose["x"] - reference["x"],
-            pose["y"] - reference["y"],
-            pose["z"] - reference["z"],
-        ],
-        dtype=np.float32,
+    reference_rotation = Rotation.from_quat(
+        [reference["qx"], reference["qy"], reference["qz"], reference["qw"]]
     )
+    # Turned into world axes, so "behind the face" follows where the head faces.
+    pivot = np.array(
+        [reference["x"], reference["y"], reference["z"]], dtype=np.float32
+    ) + reference_rotation.apply(_NECK_PIVOT_OFFSET)
+    position = (
+        np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32) - pivot
+    ).astype(np.float32)
     rotation = Rotation.from_quat([pose["qx"], pose["qy"], pose["qz"], pose["qw"]])
 
     position = _ROBOT_ROTATION.apply(position) + _FRAME_OFFSET_CELL
@@ -201,6 +519,7 @@ async def _websocket_endpoint(websocket: WebSocket):
         "right": OneEuroPoseSmoother(min_cutoff=2.0, beta=0.04, d_cutoff=1.5),
         "left": OneEuroPoseSmoother(min_cutoff=2.0, beta=0.04, d_cutoff=1.5),
     }
+    pivot_calibration = _PivotCalibration(enabled=_CALIBRATION_ENABLED)
 
     await websocket.accept()
     try:
@@ -213,6 +532,17 @@ async def _websocket_endpoint(websocket: WebSocket):
                 node.send_output("status", pa.array(["ready"]), metadata)
             elif type == "frame":
                 smoother_time = time.perf_counter()
+                # An absent button is a released one, so a controller that
+                # falls asleep mid-run cannot leave the hands stopped. The
+                # client only sends the buttons on the profiles it knows, and
+                # on those it sends them every frame.
+                samples = pivot_calibration.update(bool(response.get("button_y")))
+                if samples is not None:
+                    # Back to the headset as well as the node's output: the
+                    # operator cannot see the output while wearing one.
+                    await websocket.send_text(
+                        json.dumps(_apply_pivot_calibration(samples))
+                    )
                 node.send_output(
                     "vr_receive_times",
                     pa.array([metadata["timestamp"]], type=pa.int64()),
@@ -225,6 +555,7 @@ async def _websocket_endpoint(websocket: WebSocket):
                         _build_head_pose_output(reference),
                         metadata,
                     )
+                    pivot_calibration.add(reference)
                 for button in ["a", "b", "x", "y"]:
                     name = f"button_{button}"
                     if name in response:
@@ -236,7 +567,16 @@ async def _websocket_endpoint(websocket: WebSocket):
                 for side in ["right", "left"]:
                     pose = f"pose_{side}"
                     trigger = f"trigger_{side}"
-                    if pose in response and trigger in response and reference:
+                    # The hands stop while a run is under way. Turning the
+                    # head moves the target by the very arc being measured, and
+                    # the operator is shaking their head, not reaching. Without
+                    # --calibration no run is ever under way.
+                    if (
+                        pose in response
+                        and trigger in response
+                        and reference
+                        and not pivot_calibration.collecting
+                    ):
                         smoother = smoothers[side]
                         adjusted_pose = _adjust_pose(
                             response[pose], reference, smoother, smoother_time
@@ -292,6 +632,17 @@ async def _websocket_endpoint(websocket: WebSocket):
         pass
 
 
+@app.get("/calibration")
+async def _calibration_endpoint():
+    """Tell the front-end whether this session is a calibrating one.
+
+    The instructions are drawn in the headset only then: they tell the
+    operator to hold Y and turn their head, which is the one thing they
+    must not be told when the button means something else.
+    """
+    return {"enabled": _CALIBRATION_ENABLED}
+
+
 # The head camera routes are registered before the static files are
 # mounted on "/" because the mount matches every remaining path.
 video.register_routes(app, lambda: server.should_exit)
@@ -336,6 +687,15 @@ async def _main_async():
     await task_dora
 
 
+def _environment_flag(name):
+    """Read an on/off option's environment variable.
+
+    Anything but a plain negative turns it on, so that a dataflow YAML
+    can carry ``CALIBRATION: false`` and have it mean off.
+    """
+    return os.getenv(name, "").strip().lower() not in ("", "0", "false", "no")
+
+
 def main():
     """Run WebXR server."""
     parser = argparse.ArgumentParser(description="WebXR server")
@@ -367,6 +727,21 @@ def main():
         required=tls_key_file_default is None,
         help="TLS key file for the certificate file",
     )
+    parser.add_argument(
+        "--calibration",
+        action="store_true",
+        default=_environment_flag("CALIBRATION"),
+        help="Measure the neck pivot with the Y button (default: off)",
+    )
+    parser.add_argument(
+        "--neck-pivot-file",
+        type=pathlib.Path,
+        default=pathlib.Path(os.getenv("NECK_PIVOT_FILE", "neck_pivot.yaml")),
+        help=(
+            "YAML file a measured neck pivot offset is written to and read "
+            "back from (default: neck_pivot.yaml)"
+        ),
+    )
     video.add_arguments(parser)
 
     global args
@@ -374,11 +749,19 @@ def main():
 
     video.configure(args)
 
+    global _CALIBRATION_ENABLED, _NECK_PIVOT_FILE
+    _CALIBRATION_ENABLED = args.calibration
+    _NECK_PIVOT_FILE = args.neck_pivot_file
+
     # Read once at startup; restart the dataflow to apply a change.
-    frame_offset = (video.view_configuration().get("pose") or {}).get("frame_offset")
+    pose_configuration = video.view_configuration().get("pose") or {}
+
+    frame_offset = pose_configuration.get("frame_offset")
     if frame_offset is not None:
         global _FRAME_OFFSET_CELL
         _FRAME_OFFSET_CELL = np.array(frame_offset, dtype=np.float32).reshape(3)
+
+    _configure_neck_pivot(pose_configuration, args.neck_pivot_file)
 
     global node
     node = dora.Node()
